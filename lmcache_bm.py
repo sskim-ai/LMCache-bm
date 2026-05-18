@@ -8,6 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List
 
+REPO_DIR = Path(__file__).resolve().parent
+
 TP_COUNT = int(os.getenv("TP_COUNT", "2"))
 FILES_PER_TP = int(os.getenv("FILES_PER_TP", "32"))
 WRITE_JOBS_PER_TP = int(os.getenv("WRITE_JOBS_PER_TP", "4"))
@@ -21,7 +23,7 @@ WRITE_FILE_DELAY_MIN_MS = int(os.getenv("WRITE_FILE_DELAY_MIN_MS", "0"))
 WRITE_FILE_DELAY_MAX_MS = int(os.getenv("WRITE_FILE_DELAY_MAX_MS", "10"))
 MODE = os.getenv("MODE", "concurrent")
 
-HELPER_DIR = Path(os.getenv("HELPER_DIR", "/home/skhynix/lmcache_bm"))
+HELPER_DIR = Path(os.getenv("HELPER_DIR", str(REPO_DIR)))
 HELPER_SRC = HELPER_DIR / "lmcache_helper.c"
 HELPER_BIN = HELPER_DIR / "lmcache_helper"
 
@@ -158,9 +160,8 @@ def ensure_tools():
 
 
 def install_helper():
-    src_local = Path("/home/skhynix/lmcache_bm/lmcache_helper.c")
-    if not src_local.exists():
-        raise FileNotFoundError(f"helper source not found: {src_local}")
+    if not HELPER_SRC.exists():
+        raise FileNotFoundError(f"helper source not found: {HELPER_SRC}")
     run_subprocess(["gcc", "-O2", "-o", str(HELPER_BIN), str(HELPER_SRC)], check=True)
 
 
