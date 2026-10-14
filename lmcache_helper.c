@@ -38,16 +38,35 @@ static size_t get_alignment(const char* root) {
     return 4096;
 }
 
+static int maybe_set_direct_io(int fd, bool use_odirect) {
+    if (!use_odirect) return 0;
+#ifdef F_NOCACHE
+    return fcntl(fd, F_NOCACHE, 1);
+#else
+    (void)fd;
+    return 0;
+#endif
+}
+
 /* Read path: caller allocates aligned buffer once and reuses it across files */
 static int read_full_file_direct_reuse_buf(
     const char* path,
     void* buf,
     size_t bs,
+    bool use_odirect,
     uint64_t* total_bytes,
     uint64_t* total_ops
 ) {
-    int fd = open(path, O_RDONLY | O_DIRECT);
+    int flags = O_RDONLY;
+#ifdef O_DIRECT
+    if (use_odirect) flags |= O_DIRECT;
+#endif
+    int fd = open(path, flags);
     if (fd < 0) return -1;
+    if (maybe_set_direct_io(fd, use_odirect) != 0) {
+        close(fd);
+        return -1;
+    }
 
     while (1) {
         ssize_t n = read(fd, buf, bs);
@@ -69,11 +88,20 @@ static int write_full_file_direct_reuse_buf(
     const char* path,
     void* buf,
     size_t file_size,
+    bool use_odirect,
     uint64_t* total_bytes,
     uint64_t* total_ops
 ) {
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0644);
+    int flags = O_WRONLY | O_CREAT | O_TRUNC;
+#ifdef O_DIRECT
+    if (use_odirect) flags |= O_DIRECT;
+#endif
+    int fd = open(path, flags, 0644);
     if (fd < 0) return -1;
+    if (maybe_set_direct_io(fd, use_odirect) != 0) {
+        close(fd);
+        return -1;
+    }
 
     size_t written = 0;
     while (written < file_size) {
@@ -95,7 +123,7 @@ static int write_full_file_direct_reuse_buf(
 
 int main(int argc, char** argv) {
     if (argc < 11) {
-        fprintf(stderr, "usage: %s <mode> <root_dir> <tp> <job_or_-1> <num_files> <file_size_bytes> <bs_bytes_or_-1> <runtime_sec> <delay_min_ms> <delay_max_ms>\n", argv[0]);
+        fprintf(stderr, "usage: %s <mode> <root_dir> <tp> <job_or_-1> <num_files> <file_size_bytes> <bs_bytes_or_-1> <runtime_sec> <delay_min_ms> <delay_max_ms> [use_odirect]\n", argv[0]);
         return 2;
     }
 
@@ -109,6 +137,7 @@ int main(int argc, char** argv) {
     double runtime = atof(argv[8]);
     long delay_min_ms = atol(argv[9]);
     long delay_max_ms = atol(argv[10]);
+    bool use_odirect = argc < 12 || atoi(argv[11]) != 0;
 
     srand((unsigned int)(time(NULL) ^ getpid() ^ tp ^ (job << 8)));
     size_t alignment = get_alignment(root_dir);
@@ -137,7 +166,7 @@ int main(int argc, char** argv) {
             for (int i = 0; i < num_files; i++) {
                 if (now_sec() - start >= runtime) break;
                 snprintf(path, sizeof(path), "%s/tp%d/file_%d.bin", root_dir, tp, i);
-                if (read_full_file_direct_reuse_buf(path, read_buf, bs, &total_bytes, &total_ops) != 0) {
+                if (read_full_file_direct_reuse_buf(path, read_buf, bs, use_odirect, &total_bytes, &total_ops) != 0) {
                     fprintf(stderr, "read_full_file_direct_reuse_buf failed path=%s errno=%d %s\n", path, errno, strerror(errno));
                     free(read_buf);
                     return 1;
@@ -172,7 +201,7 @@ int main(int argc, char** argv) {
             for (int i = 0; i < num_files; i++) {
                 if (now_sec() - start >= runtime) break;
                 snprintf(path, sizeof(path), "%s/tp%d/job%d/file_%d.bin", root_dir, tp, job, i);
-                if (write_full_file_direct_reuse_buf(path, write_buf, file_size, &total_bytes, &total_ops) != 0) {
+                if (write_full_file_direct_reuse_buf(path, write_buf, file_size, use_odirect, &total_bytes, &total_ops) != 0) {
                     fprintf(stderr, "write_full_file_direct_reuse_buf failed path=%s errno=%d %s\n", path, errno, strerror(errno));
                     free(write_buf);
                     return 1;
@@ -197,13 +226,16 @@ int main(int argc, char** argv) {
     double gbps = wall > 0 ? ((double)total_bytes / 1e9) / wall : 0.0;
     double iops = wall > 0 ? ((double)total_ops) / wall : 0.0;
     double avg_delay_ms = delays_count ? ((double)delays_sum_ms / (double)delays_count) : 0.0;
+    size_t reported_bs = strcmp(mode, "write") == 0 ? file_size : bs;
 
     printf("{\"mode\":\"%s\",\"tp\":%d,\"job\":%d,\"num_files\":%d,"
            "\"file_size_bytes\":%" PRIu64 ",\"bs_bytes\":%" PRIu64 ","
            "\"passes\":%" PRIu64 ",\"total_bytes\":%" PRIu64 ",\"total_ops\":%" PRIu64 ","
            "\"wall_sec\":%.6f,\"throughput_GBps\":%.6f,\"IOPS\":%.6f,"
-           "\"delays_count\":%" PRIu64 ",\"avg_delay_ms\":%.3f}\n",
-           mode, tp, job, num_files, (uint64_t)file_size, (uint64_t)bs,
-           passes, total_bytes, total_ops, wall, gbps, iops, delays_count, avg_delay_ms);
+           "\"delays_count\":%" PRIu64 ",\"avg_delay_ms\":%.3f,"
+           "\"use_odirect\":%s}\n",
+           mode, tp, job, num_files, (uint64_t)file_size, (uint64_t)reported_bs,
+           passes, total_bytes, total_ops, wall, gbps, iops, delays_count, avg_delay_ms,
+           use_odirect ? "true" : "false");
     return 0;
 }

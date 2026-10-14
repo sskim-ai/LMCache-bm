@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import csv
 import shutil
 import subprocess
 import time
@@ -22,10 +23,11 @@ READ_PASS_DELAY_MAX_MS = int(os.getenv("READ_PASS_DELAY_MAX_MS", "10"))
 WRITE_FILE_DELAY_MIN_MS = int(os.getenv("WRITE_FILE_DELAY_MIN_MS", "0"))
 WRITE_FILE_DELAY_MAX_MS = int(os.getenv("WRITE_FILE_DELAY_MAX_MS", "10"))
 MODE = os.getenv("MODE", "concurrent")
+USE_ODIRECT = os.getenv("USE_ODIRECT", "1") == "1"
 
 HELPER_DIR = Path(os.getenv("HELPER_DIR", str(REPO_DIR)))
-HELPER_SRC = HELPER_DIR / "lmcache_helper.c"
-HELPER_BIN = HELPER_DIR / "lmcache_helper"
+HELPER_SRC = Path(os.getenv("HELPER_SRC", str(HELPER_DIR / "lmcache_helper.c")))
+HELPER_BIN = Path(os.getenv("HELPER_BIN", str(HELPER_DIR / "lmcache_helper")))
 
 NUMA_CORE_LIST = os.getenv("NUMA_CORE_LIST", "0-71,144-215")
 SPLIT_TP_CORES = os.getenv("SPLIT_TP_CORES", "1") == "1"
@@ -146,7 +148,7 @@ def tp_core_subset(tp: int):
 
 def ensure_tools():
     run_subprocess(
-        ["dd", "--version"],
+        ["dd", "if=/dev/zero", "of=/dev/null", "bs=1", "count=0"],
         check=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -232,6 +234,7 @@ def run_read(tp: int, bs: str):
         str(RUNTIME),
         str(READ_PASS_DELAY_MIN_MS),
         str(READ_PASS_DELAY_MAX_MS),
+        "1" if USE_ODIRECT else "0",
     ]
     out = run_helper(args, tp)
     out["worker"] = f"read_tp{tp}_seq"
@@ -251,6 +254,7 @@ def run_write(tp: int, job: int):
         str(RUNTIME),
         str(WRITE_FILE_DELAY_MIN_MS),
         str(WRITE_FILE_DELAY_MAX_MS),
+        "1" if USE_ODIRECT else "0",
     ]
     out = run_helper(args, tp)
     out["worker"] = f"write_tp{tp}_job{job}"
@@ -275,6 +279,7 @@ def summarize(results):
             "BIND_PARENT": BIND_PARENT,
             "BIND_ALL_SUBPROCS": BIND_ALL_SUBPROCS,
             "PARENT_AFFINITY": current_affinity_str(),
+            "USE_ODIRECT": USE_ODIRECT,
         },
         "workers": results,
         "tp_summary": {},
@@ -323,17 +328,46 @@ def summarize(results):
     return summary
 
 
+def write_workers_csv(summary, path: Path):
+    fields = [
+        "worker",
+        "mode",
+        "tp",
+        "job",
+        "num_files",
+        "file_size_bytes",
+        "bs_bytes",
+        "passes",
+        "total_bytes",
+        "total_ops",
+        "wall_sec",
+        "throughput_GBps",
+        "IOPS",
+        "delays_count",
+        "avg_delay_ms",
+        "cpu_core_range",
+        "use_odirect",
+    ]
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for row in summary["workers"]:
+            out = {field: row.get(field) for field in fields}
+            out["use_odirect"] = summary["config"]["USE_ODIRECT"]
+            writer.writerow(out)
+
+
 def print_summary(summary):
-    print("\\n=== Config ===")
+    print("\n=== Config ===")
     print(json.dumps(summary["config"], indent=2))
-    print("\\n=== TP summary ===")
+    print("\n=== TP summary ===")
     for key, item in summary["tp_summary"].items():
         print(
             f"{key}: mode={item['mode']} num_workers={item['num_workers']} "
             f"workers={item['workers']} cpu_core_ranges={item.get('cpu_core_ranges')} "
             f"GB/s={item['throughput_GBps']:.3f} IOPS={item['IOPS']:.1f}"
         )
-    print("\\n=== TP total summary ===")
+    print("\n=== TP total summary ===")
     for mode in ("read", "write"):
         item = summary["total_summary"][mode]
         print(
@@ -381,8 +415,9 @@ def main():
     summary = summarize(results)
     out = RESULT_DIR / "summary.json"
     out.write_text(json.dumps(summary, indent=2))
-    print(f"\\nHelper source: {HELPER_SRC}\\nHelper bin: {HELPER_BIN}")
-    print(f"\\nResults directory:\\n  {RESULT_DIR}")
+    write_workers_csv(summary, RESULT_DIR / "workers.csv")
+    print(f"\nHelper source: {HELPER_SRC}\nHelper bin: {HELPER_BIN}")
+    print(f"\nResults directory:\n  {RESULT_DIR}")
     print_summary(summary)
 
 
